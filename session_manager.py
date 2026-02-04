@@ -63,3 +63,23 @@ class SessionManager:
         session = self.get_session(session_id)
         session["callback_sent"] = True
         session["updated_at"] = time.time()
+
+    def cleanup_stale(
+        self,
+        max_idle_seconds: float = 86400,
+        exclude_session_id: str | None = None,
+    ) -> list[str]:
+        """
+        Remove sessions not updated in max_idle_seconds.
+        Optionally exclude a session (e.g. current request) from removal.
+        Returns list of removed session ids (for syncing agent memory).
+        """
+        now = time.time()
+        to_remove = [
+            sid for sid, s in self.sessions.items()
+            if sid != exclude_session_id
+            and (now - s["updated_at"]) > max_idle_seconds
+        ]
+        for sid in to_remove:
+            del self.sessions[sid]
+        return to_remove

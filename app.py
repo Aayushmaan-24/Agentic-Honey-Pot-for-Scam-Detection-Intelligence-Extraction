@@ -1,23 +1,32 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import logging
 import os
 import requests
 import time
 
 from session_manager import SessionManager
 from detector import detect_scam
-from agent import generate_reply
+from agent import generate_reply, cleanup_chains_for_sessions
 from extract import extract_intelligence
 
 # Load environment variables
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 API_KEY = os.getenv("API_KEY")
 if API_KEY is None:
     raise RuntimeError("API_KEY not found in .env file")
 
-GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
+GUVI_CALLBACK_URL = os.getenv(
+    "GUVI_CALLBACK_URL",
+    "https://hackathon.guvi.in/api/updateHoneyPotFinalResult",
+)
+CALLBACK_RETRIES = 3
+CALLBACK_TIMEOUT = 10
 
 # FastAPI app
 app = FastAPI(title="Agentic Honeypot API")
@@ -58,23 +67,43 @@ def should_finalize(session: dict) -> bool:
     enough_turns = session["total_messages"] >= 8
     return has_core_intel and enough_turns
 
-# Helper: send GUVI callback (exactly once)
-def send_guvi_callback(session: dict):
-    #print("✅ GUVI CALLBACK TRIGGERED for session:", session["sessionId"])
+# Helper: send GUVI callback (exactly once), with retries
+def send_guvi_callback(session: dict) -> None:
     payload = {
         "sessionId": session["sessionId"],
         "scamDetected": True,
         "totalMessagesExchanged": session["total_messages"],
         "extractedIntelligence": session["intelligence"],
-        "agentNotes": "Scammer used urgency and verification tactics to solicit sensitive details."
+        "agentNotes": "Scammer used urgency and verification tactics to solicit sensitive details.",
     }
+    last_error = None
+    for attempt in range(CALLBACK_RETRIES):
+        try:
+            r = requests.post(
+                GUVI_CALLBACK_URL,
+                json=payload,
+                timeout=CALLBACK_TIMEOUT,
+            )
+            r.raise_for_status()
+            session_manager.mark_callback_sent(session["sessionId"])
+            logger.info("GUVI callback sent for session %s", session["sessionId"])
+            return
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < CALLBACK_RETRIES - 1:
+                time.sleep(1.0 * (attempt + 1))
+    logger.warning(
+        "GUVI callback failed for session %s after %d attempts: %s",
+        session["sessionId"],
+        CALLBACK_RETRIES,
+        last_error,
+    )
 
-    try:
-        requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
-        session_manager.mark_callback_sent(session["sessionId"])
-    except Exception:
-        # Fail-safe: do not crash the API
-        pass
+@app.get("/health")
+def health():
+    """Health check for load balancers and deployments."""
+    return {"status": "ok"}
+
 
 # Main endpoint
 @app.post("/honeypot/message")
@@ -94,43 +123,50 @@ def handle_message(
     if sender != "scammer":
         return {"status": "ignored", "reply": ""}
 
-    # 3️ Load or create session
+    # 3️ Cleanup stale sessions (exclude current); sync agent memory
+    removed_ids = session_manager.cleanup_stale(
+        max_idle_seconds=86400,
+        exclude_session_id=session_id,
+    )
+    cleanup_chains_for_sessions(removed_ids)
+
+    # 4️ Load or create session
     session = session_manager.get_session(session_id)
 
-    # 4️ Increment message count
+    # 5️ Increment message count
     session_manager.increment_message_count(session_id)
 
-    # 5️ Scam detection
+    # 6️ Scam detection
     is_scam, scam_confidence = detect_scam(message_text)
 
-    # 6️ Update confidence if scam detected
+    # 7️ Update confidence if scam detected
     if is_scam:
         session_manager.update_confidence(
             session_id,
             delta=scam_confidence * 0.4
         )
 
-    # 7️ Activate agent if threshold crossed
+    # 8️ Activate agent if threshold crossed
     if session["confidence"] >= 0.6 and not session["agent_active"]:
         session_manager.activate_agent(session_id)
 
-    # 8️ Generate reply
+    # 9️ Generate reply (session_id for per-session conversation memory)
     if session["agent_active"]:
-        reply_text = generate_reply(message_text)
+        reply_text = generate_reply(session_id, message_text)
     else:
         reply_text = "I am not very sure what this means. Can you please explain?"
 
-    # 9️ Build cumulative text for extraction
+    # 10 Build cumulative text for extraction
     history_text = " ".join(
         m.get("text", "") for m in body.conversationHistory
     )
     cumulative_text = f"{history_text} {message_text} {reply_text}"
 
-    # 10 Extract & merge intelligence
+    # 11 Extract & merge intelligence
     intel = extract_intelligence(cumulative_text)
     merge_intelligence(session_id, intel)
 
-    # 1️1️ Finalize & callback (exactly once)
+    # 12 Finalize & callback (exactly once)
     if (
         session["agent_active"]
         and not session["callback_sent"]
@@ -138,7 +174,7 @@ def handle_message(
     ):
         send_guvi_callback(session)
 
-    # 1️2️ Return GUVI-compatible response
+    # 13 Return GUVI-compatible response
     return {
         "status": "success",
         "reply": reply_text
